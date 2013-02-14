@@ -25,8 +25,8 @@ namespace TestApp
                     case "list":
                         var ms = new MasterServer(new IPEndPoint(IPAddress.Parse("208.64.200.52"), 27011));
                         var servers = ms.GetServers(Region.World, @"\gamedir\naturalselection2");
-                        servers.ForEach(Console.WriteLine);
-                        Console.WriteLine("== END ({0}) ==", servers.Count);
+                        foreach (var s in servers) Console.WriteLine(s);
+                        Console.WriteLine("== END ==");
                         break;
                     default:
                         var addressParts = input.Split(':');

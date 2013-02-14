@@ -1,4 +1,6 @@
-﻿using System;
+﻿using ICSharpCode.SharpZipLib.BZip2;
+using ICSharpCode.SharpZipLib.Checksums;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -22,15 +24,12 @@ namespace SourceQuery
         // TSource Engine Query
         [NonSerialized]
         private static readonly byte[] A2S_INFO = { 0x54, 0x53, 0x6F, 0x75, 0x72, 0x63, 0x65, 0x20, 0x45, 0x6E, 0x67, 0x69, 0x6E, 0x65, 0x20, 0x51, 0x75, 0x65, 0x72, 0x79, 0x00 };
-
         [NonSerialized]
         private static readonly byte[] A2S_SERVERQUERY_GETCHALLENGE = { 0x55, 0xFF, 0xFF, 0xFF, 0xFF };
-
         [NonSerialized]
         private static readonly byte A2S_PLAYER = 0x55;
         [NonSerialized]
         private static readonly byte A2S_RULES = 0x56;
-
         [NonSerialized]
         private byte[] _challengeBytes;
 
@@ -61,6 +60,8 @@ namespace SourceQuery
 
         public GameServer()
         {
+            Players = new List<PlayerInfo>();
+            Rules = new Dictionary<string, string>();
         }
 
         public GameServer(IPAddress address)
@@ -69,6 +70,7 @@ namespace SourceQuery
         }
 
         public GameServer(IPEndPoint endpoint)
+            : this()
         {
             _endpoint = endpoint;
             Endpoint = endpoint.ToString();
@@ -79,10 +81,9 @@ namespace SourceQuery
                 _client.Client.ReceiveTimeout = (int)500;
                 _client.Connect(endpoint);
 
-                GetInfo();
-
-                Players = GetPlayerInfo();
-                Rules = GetRules();
+                RefreshMainInfo();
+                RefreshPlayerInfo();
+                RefreshRules();
             }
             _client = null;
         }
@@ -100,7 +101,7 @@ namespace SourceQuery
             return sb.ToString();
         }
 
-        private void GetInfo()
+        public void RefreshMainInfo()
         {
             Send(A2S_INFO);
             var infoData = Receive();
@@ -136,16 +137,10 @@ namespace SourceQuery
             }
         }
 
-        private List<PlayerInfo> GetPlayerInfo()
+        public void RefreshPlayerInfo()
         {
-            var players = new List<PlayerInfo>();
-            if (_challengeBytes == null)
-            {
-                Send(A2S_SERVERQUERY_GETCHALLENGE);
-                var challengeData = Receive();
-                if (challengeData[0] != 0x41) return players;
-                _challengeBytes = challengeData;
-            }
+            Players.Clear();
+            GetChallengeData();
 
             _challengeBytes[0] = A2S_PLAYER;
             Send(_challengeBytes);
@@ -153,26 +148,19 @@ namespace SourceQuery
             
             using (var br = new BinaryReader(new MemoryStream(playerData)))
             {
-                if (br.ReadByte() != 0x44) return players;
+                if (br.ReadByte() != 0x44) throw new Exception("Invalid data received in response to A2S_PLAYER request");
                 var numPlayers = br.ReadByte();
                 for (int index = 0; index < numPlayers; index++)
                 {
-                    players.Add(PlayerInfo.FromBinaryReader(br));
+                    Players.Add(PlayerInfo.FromBinaryReader(br));
                 }
             }
-            return players;
         }
 
-        private Dictionary<string, string> GetRules()
+        public void RefreshRules()
         {
-            var rules = new Dictionary<string, string>();
-            if (_challengeBytes == null)
-            {
-                Send(A2S_SERVERQUERY_GETCHALLENGE);
-                var challengeData = Receive();
-                if (challengeData[0] != 0x41) return rules;
-                _challengeBytes = challengeData;
-            }
+            Rules.Clear();
+            GetChallengeData();
 
             _challengeBytes[0] = A2S_RULES;
             Send(_challengeBytes);
@@ -180,15 +168,23 @@ namespace SourceQuery
 
             using (var br = new BinaryReader(new MemoryStream(ruleData)))
             {
-                if (br.ReadByte() != 0x45) return rules;
+                if (br.ReadByte() != 0x45) throw new Exception("Invalid data received in response to A2S_RULES request");
                 var numRules = br.ReadUInt16();
                 for (int index = 0; index < numRules; index++)
                 {
-                    rules.Add(br.ReadAnsiString(), br.ReadAnsiString());
+                    Rules.Add(br.ReadAnsiString(), br.ReadAnsiString());
                 }
             }
+        }
 
-            return rules;
+        private void GetChallengeData()
+        {
+            if (_challengeBytes != null) return;
+            
+            Send(A2S_SERVERQUERY_GETCHALLENGE);
+            var challengeData = Receive();
+            if (challengeData[0] != 0x41) throw new Exception("Unable to retrieve challenge data");
+            _challengeBytes = challengeData;            
         }
 
         private void Send(byte[] message)
@@ -205,6 +201,7 @@ namespace SourceQuery
             byte[][] packets = null;
             byte packetNumber = 0, packetCount = 1;
             bool usesBzip2 = false;
+            int crc = 0;
 
             do
             {
@@ -222,7 +219,7 @@ namespace SourceQuery
                         if (usesBzip2 && packetNumber == 0)
                         {
                             int decompressedSize = br.ReadInt32();
-                            int crc = br.ReadInt32();
+                            crc = br.ReadInt32();
                         }
                     }
 
@@ -235,13 +232,25 @@ namespace SourceQuery
             } while (packets.Any(p => p == null));
 
             var combinedData = Combine(packets);
-            return usesBzip2 ? Uncompress(combinedData) : combinedData;
+            if (usesBzip2)
+            {
+                combinedData = Decompress(combinedData);
+                Crc32 crc32 = new Crc32();
+                crc32.Update(combinedData);
+                if (crc32.Value != crc) throw new Exception("Invalid CRC for compressed packet data");
+                return combinedData;
+            }
+            return combinedData;
         }
 
-        private byte[] Uncompress(byte[] combinedData)
+        private byte[] Decompress(byte[] combinedData)
         {
-            // TODO implement
-            return combinedData;
+            using (var compressedData = new MemoryStream(combinedData))
+            using (var uncompressedData = new MemoryStream())
+            {
+                BZip2.Decompress(compressedData, uncompressedData, true);
+                return uncompressedData.ToArray();
+            }
         }
 
         private byte[] Combine(byte[][] arrays)
@@ -255,19 +264,5 @@ namespace SourceQuery
             }
             return rv;
         }
-    }
-
-    public static class BinaryReaderExtensions
-    {
-        public static string ReadAnsiString(this BinaryReader br)
-        {
-            var stringBytes = new List<byte>();
-            byte charByte;
-            while ((charByte = br.ReadByte()) != 0)
-            {
-                stringBytes.Add(charByte);
-            }
-            return Encoding.ASCII.GetString(stringBytes.ToArray());
-        }
-    }
+    }    
 }
